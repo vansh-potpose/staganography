@@ -55,16 +55,18 @@ class StegDataset(Dataset):
         self.message_length = message_length
         self.train = train
 
-        # Collect all valid image file paths
-        self.image_paths = sorted([
-            os.path.join(data_dir, fname)
-            for fname in os.listdir(data_dir)
-            if is_image_file(fname)
-        ])
+        # Collect all valid image file paths (recursively searches subdirectories)
+        self.image_paths = []
+        for root, dirs, files in os.walk(data_dir):
+            for fname in files:
+                if is_image_file(fname):
+                    self.image_paths.append(os.path.join(root, fname))
+        
+        self.image_paths = sorted(self.image_paths)
 
         if len(self.image_paths) == 0:
             raise FileNotFoundError(
-                f"No supported image files found in '{data_dir}'. "
+                f"No supported image files found in '{data_dir}' or its subdirectories. "
                 f"Supported extensions: {SUPPORTED_EXTENSIONS}"
             )
 

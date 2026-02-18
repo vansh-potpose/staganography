@@ -204,6 +204,8 @@ def load_checkpoint(encoder, decoder, checkpoint_path: str, optimizer=None):
         optimizer: Optional optimizer to restore state.
 
     Returns:
+        encoder: Encoder with loaded weights.
+        decoder: Decoder with loaded weights.
         epoch (int): The epoch the checkpoint was saved at.
         metrics (dict): The metrics at checkpoint time.
     """
@@ -218,4 +220,4 @@ def load_checkpoint(encoder, decoder, checkpoint_path: str, optimizer=None):
     metrics = checkpoint.get("metrics", {})
 
     print(f"[Checkpoint] Loaded from '{checkpoint_path}' (epoch {epoch})")
-    return epoch, metrics
+    return encoder, decoder, epoch, metrics

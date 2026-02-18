@@ -105,7 +105,7 @@ def main():
     decoder = Decoder(message_length=args.message_length).to(DEVICE)
 
     # Load checkpoint
-    epoch, metrics = load_checkpoint(encoder, decoder, args.checkpoint)
+    encoder, decoder, epoch, metrics = load_checkpoint(encoder, decoder, args.checkpoint)
     print(f"       Loaded checkpoint from epoch {epoch}")
 
     # Create test data loader

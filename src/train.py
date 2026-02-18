@@ -29,7 +29,7 @@ from src.config import (
 from src.model import Encoder, Decoder
 from src.noise_layers import CombinedNoiseLayer
 from src.losses import StegLoss
-from src.utils import compute_psnr, compute_ssim, compute_bit_accuracy, save_checkpoint
+from src.utils import compute_psnr, compute_ssim, compute_bit_accuracy, save_checkpoint, load_checkpoint
 
 
 def train_one_epoch(
@@ -214,6 +214,7 @@ def train(
     learning_rate: float = LEARNING_RATE,
     device: torch.device = DEVICE,
     checkpoint_dir: str = CHECKPOINT_DIR,
+    resume_checkpoint: str = None,
 ):
     """
     Full training procedure for the steganography system.
@@ -257,14 +258,28 @@ def train(
 
     # Learning rate scheduler: reduce LR when loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10, verbose=True,
+        optimizer, mode="min", factor=0.5, patience=10,
     )
+
+    # Resume from checkpoint if specified
+    start_epoch = 1
+    best_bit_accuracy = 0.0
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        print(f"\n[Resume] Loading checkpoint from '{resume_checkpoint}'...")
+        encoder, decoder, start_epoch_loaded, loaded_metrics = load_checkpoint(
+            encoder, decoder, resume_checkpoint, optimizer
+        )
+        start_epoch = start_epoch_loaded + 1
+        best_bit_accuracy = loaded_metrics.get("bit_accuracy", 0.0)
+        print(f"[Resume] Resuming from epoch {start_epoch}")
+        print(f"[Resume] Previous best bit accuracy: {best_bit_accuracy:.4f}")
+    elif resume_checkpoint:
+        print(f"\n[Warning] Resume checkpoint '{resume_checkpoint}' not found. Starting from scratch.")
 
     # Training history
     history = {"train": [], "val": []}
-    best_bit_accuracy = 0.0
 
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(start_epoch, num_epochs + 1):
         start_time = time.time()
 
         # ---- Training ----

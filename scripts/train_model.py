@@ -76,6 +76,10 @@ def parse_args():
         "--num_workers", type=int, default=4,
         help="Number of data loading workers.",
     )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to checkpoint to resume training from (e.g., checkpoints/latest_model.pth).",
+    )
 
     return parser.parse_args()
 
@@ -128,6 +132,7 @@ def main():
         learning_rate=args.lr,
         device=DEVICE,
         checkpoint_dir=args.save_dir,
+        resume_checkpoint=args.resume,
     )
 
     print("\nTraining complete! Checkpoints saved to:", args.save_dir)
