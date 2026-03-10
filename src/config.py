@@ -17,41 +17,47 @@ IMAGE_CHANNELS = 3        # RGB images
 # ============================================================================
 # Message Settings
 # ============================================================================
-MESSAGE_LENGTH = 30       # Number of hidden bits to embed
+MESSAGE_LENGTH = 64       # Number of hidden bits to embed (8 bytes)
 
 # ============================================================================
 # Training Hyperparameters
 # ============================================================================
-BATCH_SIZE = 16           # Training batch size (adjust based on GPU memory)
-LEARNING_RATE = 1e-3      # Adam optimizer learning rate
+BATCH_SIZE = 32           # Training batch size
+LEARNING_RATE = 5e-4      # Adam optimizer learning rate (reduced for stability)
 NUM_EPOCHS = 100          # Total training epochs
 WEIGHT_DECAY = 1e-5       # L2 regularization
 
-# Loss weights
-LAMBDA_IMAGE = 0.7        # Weight for image reconstruction loss
-LAMBDA_MESSAGE = 1.0      # Weight for message recovery loss
+# Loss weights — message recovery is the primary objective
+LAMBDA_IMAGE = 0.3        # Weight for image reconstruction loss
+LAMBDA_MESSAGE = 3.0      # Weight for message recovery loss
+
+# ============================================================================
+# Training Schedule
+# ============================================================================
+WARMUP_EPOCHS = 5         # Epochs without noise (learn clean embedding first)
+NOISE_RAMP_EPOCHS = 20    # Epochs to linearly ramp noise to full strength
 
 # ============================================================================
 # Noise Layer Settings
 # ============================================================================
-NOISE_PROBABILITY = 0.8   # Probability of applying noise during training
+NOISE_PROBABILITY = 0.5   # Max probability of applying noise during training
 
 # JPEG compression
 JPEG_QUALITY_MIN = 50     # Minimum JPEG quality factor
 JPEG_QUALITY_MAX = 100    # Maximum JPEG quality factor
 
-# Gaussian noise
-GAUSSIAN_NOISE_MIN = 0.01  # Minimum noise standard deviation
-GAUSSIAN_NOISE_MAX = 0.05  # Maximum noise standard deviation
+# Gaussian noise (gentler range)
+GAUSSIAN_NOISE_MIN = 0.005  # Minimum noise standard deviation
+GAUSSIAN_NOISE_MAX = 0.03   # Maximum noise standard deviation (reduced from 0.05)
 
-# Cropout
-CROPOUT_MIN_RATIO = 0.1   # Minimum crop area ratio
-CROPOUT_MAX_RATIO = 0.3   # Maximum crop area ratio
+# Cropout (gentler range)
+CROPOUT_MIN_RATIO = 0.05   # Minimum crop area ratio
+CROPOUT_MAX_RATIO = 0.2    # Maximum crop area ratio (reduced from 0.3)
 
 # Gaussian blur
-BLUR_KERNEL_SIZES = [3, 5, 7]   # Possible blur kernel sizes
-BLUR_SIGMA_MIN = 0.5            # Minimum blur sigma
-BLUR_SIGMA_MAX = 2.0            # Maximum blur sigma
+BLUR_KERNEL_SIZES = [3, 5]        # Possible blur kernel sizes (removed 7)
+BLUR_SIGMA_MIN = 0.5              # Minimum blur sigma
+BLUR_SIGMA_MAX = 1.5              # Maximum blur sigma (reduced from 2.0)
 
 # ============================================================================
 # Paths

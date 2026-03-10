@@ -9,11 +9,6 @@ Example:
         --checkpoint checkpoints/best_model.pth \
         --data_dir data/val2017 \
         --output_dir results/
-
-This script:
-  1. Loads a trained encoder–decoder from a checkpoint.
-  2. Evaluates robustness against 13 different attack configurations.
-  3. Generates a summary table, bar chart, and sample comparison images.
 """
 
 import sys
@@ -108,14 +103,14 @@ def main():
     encoder, decoder, epoch, metrics = load_checkpoint(encoder, decoder, args.checkpoint)
     print(f"       Loaded checkpoint from epoch {epoch}")
 
-    # Create test data loader
+    # Create test data loader (use data_dir as single directory, no val split needed)
     print("[2/3] Creating test data loader...")
-    _, test_loader = get_data_loaders(
-        train_dir=args.data_dir,  # Using as test directory
-        val_dir=None,
+    test_loader, _ = get_data_loaders(
+        data_dir=args.data_dir,
         image_size=args.image_size,
         message_length=args.message_length,
         batch_size=args.batch_size,
+        val_split=0.0,  # Use all data for testing
         num_workers=args.num_workers,
     )
 

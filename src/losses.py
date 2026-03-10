@@ -1,14 +1,11 @@
 """
-losses.py — Loss functions for steganography training.
+losses.py — Improved loss functions for steganography training.
 
-The total loss combines two objectives:
-  1. Image Loss: Ensures the stego image is visually similar to the cover image.
-     - MSE loss for pixel-level fidelity.
-     - SSIM loss for structural similarity preservation.
-  2. Message Loss: Ensures the hidden message can be accurately recovered.
-     - Binary Cross-Entropy (BCE) between original and decoded messages.
-
-Total loss = λ_image * L_image + λ_message * L_message
+Key improvements:
+  1. BCEWithLogitsLoss instead of BCELoss (numerically stable)
+  2. Confidence penalty to push predictions away from 0.5
+  
+Total loss = λ_image * L_image + λ_message * L_message + λ_confidence * L_confidence
 """
 
 import torch
@@ -21,24 +18,13 @@ from src.config import LAMBDA_IMAGE, LAMBDA_MESSAGE
 class SSIMLoss(nn.Module):
     """
     Differentiable Structural Similarity Index (SSIM) loss.
-
-    SSIM measures the perceived quality of an image by comparing luminance,
-    contrast, and structure. The loss is defined as (1 - SSIM), so minimizing
-    this loss maximizes structural similarity.
-
-    Uses a Gaussian window for local statistics computation.
-
-    Args:
-        window_size (int): Size of the Gaussian window (must be odd).
-        sigma (float): Standard deviation of the Gaussian window.
+    Loss = 1 - SSIM, so minimizing this maximizes structural similarity.
     """
 
     def __init__(self, window_size: int = 11, sigma: float = 1.5):
         super().__init__()
         self.window_size = window_size
         self.sigma = sigma
-
-        # Pre-compute Gaussian window
         self.register_buffer("window", self._create_window(window_size, sigma))
 
     @staticmethod
@@ -51,22 +37,10 @@ class SSIMLoss(nn.Module):
         return gauss_2d.unsqueeze(0).unsqueeze(0)  # (1, 1, K, K)
 
     def forward(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
-        """
-        Compute SSIM loss between two images.
-
-        Args:
-            img1, img2 (Tensor): Images of shape (B, C, H, W), values in [0, 1].
-
-        Returns:
-            loss (Tensor): Scalar SSIM loss = 1 - mean(SSIM).
-        """
         channels = img1.shape[1]
-
-        # Expand window to all channels
         window = self.window.expand(channels, -1, -1, -1).to(img1.device)
         padding = self.window_size // 2
 
-        # Compute local means
         mu1 = F.conv2d(img1, window, padding=padding, groups=channels)
         mu2 = F.conv2d(img2, window, padding=padding, groups=channels)
 
@@ -74,85 +48,88 @@ class SSIMLoss(nn.Module):
         mu2_sq = mu2 ** 2
         mu12 = mu1 * mu2
 
-        # Compute local variances and covariance
         sigma1_sq = F.conv2d(img1 ** 2, window, padding=padding, groups=channels) - mu1_sq
         sigma2_sq = F.conv2d(img2 ** 2, window, padding=padding, groups=channels) - mu2_sq
         sigma12 = F.conv2d(img1 * img2, window, padding=padding, groups=channels) - mu12
 
-        # Stability constants
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
 
-        # SSIM formula
         numerator = (2 * mu12 + C1) * (2 * sigma12 + C2)
         denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
         ssim_map = numerator / denominator
 
-        # Return loss (1 - SSIM, averaged over all pixels and channels)
         return 1.0 - ssim_map.mean()
 
 
 class StegLoss(nn.Module):
     """
-    Combined steganography loss function.
+    Improved combined steganography loss function.
 
-    Balances two objectives:
-      - Image fidelity: MSE + SSIM loss between cover and stego images.
-      - Message recovery: BCE loss between original and decoded messages.
+    Changes from original:
+      - Uses BCEWithLogitsLoss (numerically stable, handles logit outputs)
+      - Adds confidence penalty pushing predictions away from 0.5
 
     Args:
-        lambda_image (float): Weight for the image loss term.
-        lambda_message (float): Weight for the message loss term.
+        lambda_image (float): Weight for image loss.
+        lambda_message (float): Weight for message loss.
+        lambda_confidence (float): Weight for confidence penalty.
     """
 
     def __init__(
         self,
         lambda_image: float = LAMBDA_IMAGE,
         lambda_message: float = LAMBDA_MESSAGE,
+        lambda_confidence: float = 0.1,
     ):
         super().__init__()
         self.lambda_image = lambda_image
         self.lambda_message = lambda_message
+        self.lambda_confidence = lambda_confidence
 
         # Sub-losses
         self.mse_loss = nn.MSELoss()
         self.ssim_loss = SSIMLoss()
-        self.bce_loss = nn.BCELoss()
+        # BCEWithLogitsLoss: decoder outputs logits, sigmoid is applied internally
+        self.bce_loss = nn.BCEWithLogitsLoss()
 
     def forward(
         self,
         cover_image: torch.Tensor,
         stego_image: torch.Tensor,
         original_message: torch.Tensor,
-        decoded_message: torch.Tensor,
+        decoded_logits: torch.Tensor,
     ) -> dict:
         """
         Compute the combined loss.
 
         Args:
-            cover_image (Tensor): Original cover image, shape (B, 3, H, W).
-            stego_image (Tensor): Generated stego image, shape (B, 3, H, W).
-            original_message (Tensor): Original binary message, shape (B, L).
-            decoded_message (Tensor): Decoded message probabilities, shape (B, L).
+            cover_image: Original cover image, shape (B, 3, H, W).
+            stego_image: Generated stego image, shape (B, 3, H, W).
+            original_message: Original binary message, shape (B, L).
+            decoded_logits: Decoder output LOGITS (not probabilities), shape (B, L).
 
         Returns:
-            loss_dict (dict): Dictionary containing:
-                - 'total': Combined total loss (scalar).
-                - 'image_mse': MSE component of image loss.
-                - 'image_ssim': SSIM component of image loss.
-                - 'image_total': Weighted total image loss.
-                - 'message': Weighted message loss.
+            loss_dict with 'total', 'image_mse', 'image_ssim', 'image_total', 'message'.
         """
         # Image losses
         mse = self.mse_loss(stego_image, cover_image)
         ssim = self.ssim_loss(stego_image, cover_image)
-        image_loss = mse + ssim  # Combined pixel + structural loss
+        image_loss = mse + ssim
 
-        # Message loss
-        message_loss = self.bce_loss(decoded_message, original_message)
+        # Message loss (BCEWithLogitsLoss applies sigmoid internally)
+        message_loss = self.bce_loss(decoded_logits, original_message)
+
+        # Confidence penalty: penalize logits near 0 (i.e., probabilities near 0.5)
+        # This encourages the model to make confident predictions
+        confidence_penalty = torch.mean(torch.exp(-decoded_logits.abs()))
 
         # Total weighted loss
-        total_loss = self.lambda_image * image_loss + self.lambda_message * message_loss
+        total_loss = (
+            self.lambda_image * image_loss
+            + self.lambda_message * message_loss
+            + self.lambda_confidence * confidence_penalty
+        )
 
         return {
             "total": total_loss,

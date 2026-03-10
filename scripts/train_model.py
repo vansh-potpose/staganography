@@ -5,13 +5,7 @@ Usage:
     python scripts/train_model.py --data_dir <path_to_images> [OPTIONS]
 
 Example:
-    python scripts/train_model.py --data_dir data/train2017 --epochs 100 --batch_size 16
-
-This script:
-  1. Parses command-line arguments for training configuration.
-  2. Creates training (and optional validation) data loaders.
-  3. Runs the full training loop with distortion-aware noise injection.
-  4. Saves checkpoints to the specified directory.
+    python scripts/train_model.py --data_dir data/train2017 --epochs 100 --batch_size 32
 """
 
 import sys
@@ -27,6 +21,7 @@ from src.train import train
 from src.config import (
     NUM_EPOCHS, BATCH_SIZE, LEARNING_RATE, MESSAGE_LENGTH,
     IMAGE_SIZE, CHECKPOINT_DIR, DEVICE,
+    WARMUP_EPOCHS, NOISE_RAMP_EPOCHS,
 )
 
 
@@ -46,7 +41,11 @@ def parse_args():
     # Optional arguments
     parser.add_argument(
         "--val_dir", type=str, default=None,
-        help="Path to the directory containing validation images.",
+        help="Path to validation images. If not set, auto-splits from data_dir.",
+    )
+    parser.add_argument(
+        "--val_split", type=float, default=0.1,
+        help="Fraction of data to use for validation (if val_dir not set).",
     )
     parser.add_argument(
         "--epochs", type=int, default=NUM_EPOCHS,
@@ -69,6 +68,14 @@ def parse_args():
         help="Size to resize images to (square).",
     )
     parser.add_argument(
+        "--warmup_epochs", type=int, default=WARMUP_EPOCHS,
+        help="Epochs without noise (warmup phase).",
+    )
+    parser.add_argument(
+        "--ramp_epochs", type=int, default=NOISE_RAMP_EPOCHS,
+        help="Epochs to linearly ramp noise to full strength.",
+    )
+    parser.add_argument(
         "--save_dir", type=str, default=CHECKPOINT_DIR,
         help="Directory to save model checkpoints.",
     )
@@ -78,7 +85,7 @@ def parse_args():
     )
     parser.add_argument(
         "--resume", type=str, default=None,
-        help="Path to checkpoint to resume training from (e.g., checkpoints/latest_model.pth).",
+        help="Path to checkpoint to resume training from.",
     )
 
     return parser.parse_args()
@@ -92,12 +99,14 @@ def main():
     print("  ROBUST IMAGE STEGANOGRAPHY — TRAINING SCRIPT")
     print("=" * 70)
     print(f"  Data directory:     {args.data_dir}")
-    print(f"  Validation dir:     {args.val_dir or 'None (training only)'}")
+    print(f"  Validation dir:     {args.val_dir or f'Auto-split ({args.val_split:.0%})'}")
     print(f"  Epochs:             {args.epochs}")
     print(f"  Batch size:         {args.batch_size}")
     print(f"  Learning rate:      {args.lr}")
     print(f"  Message length:     {args.message_length} bits")
     print(f"  Image size:         {args.image_size}×{args.image_size}")
+    print(f"  Warmup epochs:      {args.warmup_epochs}")
+    print(f"  Noise ramp epochs:  {args.ramp_epochs}")
     print(f"  Checkpoint dir:     {args.save_dir}")
     print(f"  Device:             {DEVICE}")
     print("=" * 70 + "\n")
@@ -113,14 +122,24 @@ def main():
 
     # Create data loaders
     print("[1/2] Creating data loaders...")
-    train_loader, val_loader = get_data_loaders(
-        train_dir=args.data_dir,
-        val_dir=args.val_dir,
-        image_size=args.image_size,
-        message_length=args.message_length,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-    )
+    if args.val_dir:
+        train_loader, val_loader = get_data_loaders(
+            train_dir=args.data_dir,
+            val_dir=args.val_dir,
+            image_size=args.image_size,
+            message_length=args.message_length,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        train_loader, val_loader = get_data_loaders(
+            data_dir=args.data_dir,
+            image_size=args.image_size,
+            message_length=args.message_length,
+            batch_size=args.batch_size,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+        )
 
     # Start training
     print("[2/2] Starting training...\n")
@@ -133,6 +152,8 @@ def main():
         device=DEVICE,
         checkpoint_dir=args.save_dir,
         resume_checkpoint=args.resume,
+        warmup_epochs=args.warmup_epochs,
+        ramp_epochs=args.ramp_epochs,
     )
 
     print("\nTraining complete! Checkpoints saved to:", args.save_dir)

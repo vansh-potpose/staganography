@@ -139,15 +139,16 @@ def evaluate_single_attack(
 
         # Apply attack
         if needs_cover:
-            attacked_images = attack_layer(stego_images, cover_images)
+            attacked_images = attack_layer(stego_images, cover_images, noise_strength=1.0)
         else:
-            attacked_images = attack_layer(stego_images)
+            attacked_images = attack_layer(stego_images, noise_strength=1.0)
 
-        # Decode message from attacked image
-        decoded_messages = decoder(attacked_images)
+        # Decode message from attacked image (decoder outputs logits)
+        decoded_logits = decoder(attacked_images)
+        decoded_probs = torch.sigmoid(decoded_logits)
 
         # Compute bit accuracy (after attack)
-        bit_acc = compute_bit_accuracy(messages, decoded_messages)
+        bit_acc = compute_bit_accuracy(messages, decoded_probs)
 
         psnr_list.append(psnr)
         ssim_list.append(ssim)

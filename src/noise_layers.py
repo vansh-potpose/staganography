@@ -1,20 +1,9 @@
 """
 noise_layers.py — Differentiable distortion layers for robust steganography training.
 
-This module implements various image distortion layers that are inserted between
-the encoder and decoder during training. Each distortion simulates a real-world
-image processing operation, forcing the encoder to embed messages that survive
-these attacks.
-
-Supported Distortions:
-  1. Identity (no distortion)
-  2. JPEG compression (differentiable approximation)
-  3. Gaussian noise
-  4. Cropout (replace random region with cover image content)
-  5. Gaussian blur
-
-All layers are designed to be differentiable (or use straight-through estimators)
-so that gradients can flow back through the noise layer to the encoder.
+Improvements:
+  - Added noise_strength parameter for progressive noise ramping
+  - Gentler default noise intensities
 """
 
 import random
@@ -35,7 +24,8 @@ from src.config import (
 class Identity(nn.Module):
     """No distortion — passes the stego image through unchanged."""
 
-    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None,
+                noise_strength: float = 1.0) -> torch.Tensor:
         return stego_image
 
 
@@ -43,17 +33,8 @@ class JpegCompression(nn.Module):
     """
     Differentiable JPEG compression simulation.
 
-    Since real JPEG compression involves non-differentiable quantization,
-    we approximate it by:
-      1. Adding scaled uniform noise to simulate quantization artifacts.
-      2. Applying a low-pass filter to simulate DCT coefficient truncation.
-
-    The strength of the distortion is controlled by the quality factor (QF).
-    Lower QF = more aggressive compression = more distortion.
-
-    Args:
-        quality_min (int): Minimum JPEG quality factor.
-        quality_max (int): Maximum JPEG quality factor.
+    Approximates JPEG artifacts by adding scaled noise and optional blur.
+    The strength is controlled by the quality factor.
     """
 
     def __init__(self, quality_min: int = JPEG_QUALITY_MIN, quality_max: int = JPEG_QUALITY_MAX):
@@ -61,31 +42,19 @@ class JpegCompression(nn.Module):
         self.quality_min = quality_min
         self.quality_max = quality_max
 
-    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None) -> torch.Tensor:
-        """
-        Apply simulated JPEG compression.
-
-        Args:
-            stego_image (Tensor): Input stego image, shape (B, 3, H, W).
-            cover_image (Tensor): Unused (kept for consistent interface).
-
-        Returns:
-            Distorted image tensor.
-        """
+    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None,
+                noise_strength: float = 1.0) -> torch.Tensor:
         if not self.training:
             return stego_image
 
-        # Randomly sample a quality factor
-        quality = random.randint(self.quality_min, self.quality_max)
+        # Interpolate quality based on noise_strength (higher strength = lower quality)
+        effective_min = int(self.quality_max - noise_strength * (self.quality_max - self.quality_min))
+        quality = random.randint(effective_min, self.quality_max)
 
-        # Compression strength: lower quality → higher noise scale
         noise_scale = (100 - quality) / 100.0 * 0.1
-
-        # Add quantization noise (straight-through estimator for gradients)
         noise = torch.randn_like(stego_image) * noise_scale
         noised = stego_image + noise
 
-        # Simulate frequency truncation with a small Gaussian blur
         if quality < 80:
             kernel_size = 3
             sigma = (100 - quality) / 100.0
@@ -95,115 +64,75 @@ class JpegCompression(nn.Module):
 
     @staticmethod
     def _gaussian_blur(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
-        """Apply Gaussian blur using a separable convolution."""
         channels = x.shape[1]
-
-        # Create 1D Gaussian kernel
         coords = torch.arange(kernel_size, dtype=torch.float32, device=x.device)
         coords -= kernel_size // 2
-        kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel_1d = torch.exp(-0.5 * (coords / max(sigma, 1e-6)) ** 2)
         kernel_1d = kernel_1d / kernel_1d.sum()
-
-        # Create 2D kernel via outer product
-        kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)  # (K, K)
-        kernel_2d = kernel_2d.expand(channels, 1, -1, -1)  # (C, 1, K, K)
-
+        kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)
+        kernel_2d = kernel_2d.expand(channels, 1, -1, -1)
         padding = kernel_size // 2
         return F.conv2d(x, kernel_2d, padding=padding, groups=channels)
 
 
 class GaussianNoise(nn.Module):
-    """
-    Additive Gaussian noise distortion.
-
-    Adds zero-mean Gaussian noise with a randomly sampled standard deviation.
-    Fully differentiable via the reparameterization trick.
-
-    Args:
-        sigma_min (float): Minimum noise standard deviation.
-        sigma_max (float): Maximum noise standard deviation.
-    """
+    """Additive Gaussian noise with strength scaling."""
 
     def __init__(self, sigma_min: float = GAUSSIAN_NOISE_MIN, sigma_max: float = GAUSSIAN_NOISE_MAX):
         super().__init__()
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
 
-    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None,
+                noise_strength: float = 1.0) -> torch.Tensor:
         if not self.training:
             return stego_image
 
-        # Randomly sample noise standard deviation
-        sigma = random.uniform(self.sigma_min, self.sigma_max)
+        # Scale sigma range by noise_strength
+        effective_max = self.sigma_min + noise_strength * (self.sigma_max - self.sigma_min)
+        sigma = random.uniform(self.sigma_min, effective_max)
 
-        # Add Gaussian noise
         noise = torch.randn_like(stego_image) * sigma
         noised = stego_image + noise
-
         return torch.clamp(noised, 0.0, 1.0)
 
 
 class Cropout(nn.Module):
-    """
-    Cropout distortion layer.
-
-    Randomly selects a rectangular region and replaces it with the corresponding
-    region from the cover image. This simulates partial image loss/replacement.
-
-    The crop area ratio is randomly sampled between cropout_min and cropout_max.
-    This layer is differentiable because it uses a binary mask.
-
-    Args:
-        cropout_min (float): Minimum fraction of area to crop out.
-        cropout_max (float): Maximum fraction of area to crop out.
-    """
+    """Cropout distortion with strength scaling."""
 
     def __init__(self, cropout_min: float = CROPOUT_MIN_RATIO, cropout_max: float = CROPOUT_MAX_RATIO):
         super().__init__()
         self.cropout_min = cropout_min
         self.cropout_max = cropout_max
 
-    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None,
+                noise_strength: float = 1.0) -> torch.Tensor:
         if not self.training or cover_image is None:
             return stego_image
 
         batch_size, channels, height, width = stego_image.shape
 
-        # Randomly determine crop area
-        crop_ratio = random.uniform(self.cropout_min, self.cropout_max)
+        # Scale crop ratio by noise_strength
+        effective_max = self.cropout_min + noise_strength * (self.cropout_max - self.cropout_min)
+        crop_ratio = random.uniform(self.cropout_min, effective_max)
         crop_height = int(height * math.sqrt(crop_ratio))
         crop_width = int(width * math.sqrt(crop_ratio))
 
-        # Ensure minimum size
         crop_height = max(1, min(crop_height, height))
         crop_width = max(1, min(crop_width, width))
 
-        # Random position for the crop rectangle
         top = random.randint(0, height - crop_height)
         left = random.randint(0, width - crop_width)
 
-        # Create a binary mask (1 = keep stego, 0 = replace with cover)
         mask = torch.ones_like(stego_image)
         mask[:, :, top:top + crop_height, left:left + crop_width] = 0.0
 
-        # Apply mask: keep stego outside crop, use cover inside crop
         result = stego_image * mask + cover_image * (1.0 - mask)
-
         return result
 
 
 class GaussianBlur(nn.Module):
-    """
-    Gaussian blur distortion layer.
-
-    Applies a Gaussian blur filter with randomly sampled kernel size and sigma.
-    Implemented as a depthwise convolution, which is fully differentiable.
-
-    Args:
-        kernel_sizes (list): List of possible kernel sizes (must be odd).
-        sigma_min (float): Minimum blur sigma.
-        sigma_max (float): Maximum blur sigma.
-    """
+    """Gaussian blur distortion with strength scaling."""
 
     def __init__(
         self,
@@ -216,47 +145,40 @@ class GaussianBlur(nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
 
-    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None,
+                noise_strength: float = 1.0) -> torch.Tensor:
         if not self.training:
             return stego_image
 
-        # Randomly sample blur parameters
+        # Scale sigma by noise_strength
+        effective_max = self.sigma_min + noise_strength * (self.sigma_max - self.sigma_min)
         kernel_size = random.choice(self.kernel_sizes)
-        sigma = random.uniform(self.sigma_min, self.sigma_max)
+        sigma = random.uniform(self.sigma_min, effective_max)
 
         return self._apply_blur(stego_image, kernel_size, sigma)
 
     @staticmethod
     def _apply_blur(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
-        """Apply Gaussian blur using depthwise separable convolution."""
         channels = x.shape[1]
-
-        # Create 1D Gaussian kernel
         coords = torch.arange(kernel_size, dtype=torch.float32, device=x.device)
         coords -= kernel_size // 2
         kernel_1d = torch.exp(-0.5 * (coords / max(sigma, 1e-6)) ** 2)
         kernel_1d = kernel_1d / kernel_1d.sum()
-
-        # Create 2D kernel
         kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)
         kernel_2d = kernel_2d.expand(channels, 1, -1, -1)
-
         padding = kernel_size // 2
         return F.conv2d(x, kernel_2d, padding=padding, groups=channels)
 
 
 class CombinedNoiseLayer(nn.Module):
     """
-    Combined noise layer that randomly selects one distortion per forward pass.
+    Combined noise layer with progressive noise ramping.
 
-    During training, with probability `noise_probability`, a random distortion
-    is applied to the stego image. Otherwise, the identity is applied.
+    Uses a noise_strength parameter (0.0 to 1.0) that controls:
+      - The probability of applying any noise
+      - The intensity of each noise type
 
-    This randomized schedule forces the encoder to embed robustly against
-    all supported attack types simultaneously.
-
-    Args:
-        noise_probability (float): Probability of applying a distortion (vs. identity).
+    This enables smooth progressive noise increase during training.
     """
 
     def __init__(self, noise_probability: float = NOISE_PROBABILITY):
@@ -272,22 +194,26 @@ class CombinedNoiseLayer(nn.Module):
             GaussianBlur(),
         ])
 
-        # Layer names for logging
         self.layer_names = ["identity", "jpeg", "gaussian_noise", "cropout", "gaussian_blur"]
 
-    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None):
+    def forward(self, stego_image: torch.Tensor, cover_image: torch.Tensor = None,
+                noise_strength: float = 1.0):
         """
-        Apply a random distortion during training.
+        Apply a random distortion during training with controlled strength.
 
         Args:
-            stego_image (Tensor): Encoder output, shape (B, 3, H, W).
-            cover_image (Tensor): Original cover image (needed for Cropout).
+            stego_image: Encoder output, shape (B, 3, H, W).
+            cover_image: Original cover image (needed for Cropout).
+            noise_strength: Float from 0.0 to 1.0 controlling noise intensity.
 
         Returns:
-            noised_image (Tensor): Distorted stego image.
-            noise_name (str): Name of the applied distortion (for logging).
+            noised_image: Distorted stego image.
+            noise_name: Name of the applied distortion (for logging).
         """
-        if not self.training or random.random() > self.noise_probability:
+        # Scale the probability of applying noise by noise_strength
+        effective_probability = self.noise_probability * noise_strength
+
+        if not self.training or random.random() > effective_probability:
             return stego_image, "identity"
 
         # Randomly select a distortion (excluding Identity at index 0)
@@ -295,6 +221,6 @@ class CombinedNoiseLayer(nn.Module):
         noise_layer = self.noise_layers[idx]
         noise_name = self.layer_names[idx]
 
-        noised_image = noise_layer(stego_image, cover_image)
+        noised_image = noise_layer(stego_image, cover_image, noise_strength=noise_strength)
 
         return noised_image, noise_name
