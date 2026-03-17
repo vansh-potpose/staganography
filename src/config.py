@@ -26,6 +26,8 @@ BATCH_SIZE = 32           # Training batch size (increased for better stability)
 LEARNING_RATE = 1e-3      # Adam optimizer learning rate
 NUM_EPOCHS = 100          # Total training epochs
 WEIGHT_DECAY = 1e-5       # L2 regularization
+WARMUP_EPOCHS = 10        # Epochs to train without noise (warmup phase)
+NOISE_RAMP_EPOCHS = 20    # Epochs to linearly ramp noise to full strength
 
 # Loss weights (message loss is critical for accuracy)
 LAMBDA_IMAGE = 0.5        # Weight for image reconstruction loss (reduced)

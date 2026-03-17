@@ -85,8 +85,8 @@ def compute_bit_accuracy(original: torch.Tensor, decoded: torch.Tensor) -> float
     Returns:
         accuracy (float): Fraction of correctly decoded bits (0.0 to 1.0).
     """
-    # Threshold decoded probabilities at 0.5
-    decoded_bits = (decoded.detach() > 0.5).float()
+    # Apply sigmoid to convert logits to probabilities, then threshold at 0.5
+    decoded_bits = (torch.sigmoid(decoded.detach()) > 0.5).float()
     original_bits = original.detach()
 
     # Compare bit by bit

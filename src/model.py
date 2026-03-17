@@ -204,16 +204,16 @@ class Decoder(nn.Module):
         # Concatenate multi-scale features
         combined_features = torch.cat([f5_pooled, f3_pooled], dim=1)  # (B, hidden_channels*3)
         
-        # Predict message bits
-        decoded_message = torch.sigmoid(self.fc_layers(combined_features))  # (B, message_length)
+        # Predict message bits (output raw logits — sigmoid applied in loss function)
+        decoded_logits = self.fc_layers(combined_features)  # (B, message_length)
         
-        return decoded_message
+        return decoded_logits
 
 
 # ============================================================================
 # Utility: Create encoder-decoder pair
 # ============================================================================
-def create_model(message_length: int = MESSAGE_LENGTH, hidden_channels: int = 64):
+def create_model(message_length: int = MESSAGE_LENGTH, hidden_channels: int = 128):
     """
     Factory function to create an encoder-decoder pair.
 

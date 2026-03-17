@@ -25,6 +25,7 @@ from tqdm import tqdm
 from src.config import (
     DEVICE, NUM_EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
     CHECKPOINT_DIR, MESSAGE_LENGTH,
+    WARMUP_EPOCHS, NOISE_RAMP_EPOCHS,
 )
 from src.model import Encoder, Decoder
 from src.noise_layers import CombinedNoiseLayer
@@ -42,6 +43,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     warmup_epochs: int = 0,
+    noise_strength: float = 1.0,
 ):
     """
     Train for one epoch.
@@ -89,8 +91,8 @@ def train_one_epoch(
 
         # Step 2: Apply random distortion (skip during warmup phase)
         if epoch > warmup_epochs:
-            # Use noise after warmup period
-            noised_images, noise_name = noise_layer(stego_images, cover_images)
+            # Use noise after warmup period with progressive strength
+            noised_images, noise_name = noise_layer(stego_images, cover_images, noise_strength=noise_strength)
         else:
             # No noise during warmup - let model learn clean embedding first
             noised_images, noise_name = stego_images, "warmup_no_noise"
@@ -222,7 +224,8 @@ def train(
     device: torch.device = DEVICE,
     checkpoint_dir: str = CHECKPOINT_DIR,
     resume_checkpoint: str = None,
-    warmup_epochs: int = 10,
+    warmup_epochs: int = WARMUP_EPOCHS,
+    ramp_epochs: int = NOISE_RAMP_EPOCHS,
 ):
     """
     Full training procedure for the steganography system.
@@ -292,10 +295,19 @@ def train(
     for epoch in range(start_epoch, num_epochs + 1):
         start_time = time.time()
 
+        # Compute progressive noise strength for this epoch
+        if epoch <= warmup_epochs:
+            noise_strength = 0.0
+        elif epoch <= warmup_epochs + ramp_epochs:
+            noise_strength = (epoch - warmup_epochs) / ramp_epochs
+        else:
+            noise_strength = 1.0
+
         # ---- Training ----
         train_metrics = train_one_epoch(
             encoder, decoder, noise_layer, criterion, optimizer,
             train_loader, device, epoch, warmup_epochs=warmup_epochs,
+            noise_strength=noise_strength,
         )
         history["train"].append(train_metrics)
 
