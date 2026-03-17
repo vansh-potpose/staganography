@@ -1,28 +1,35 @@
 """
-model.py — Improved Encoder and Decoder networks for image steganography.
+model.py — Encoder and Decoder networks for image steganography.
 
-Key improvements over the original:
-  - Encoder: Message pre-processing MLP, deeper post-fusion, smooth residual scaling
-  - Decoder: Multi-scale feature extraction with downsampling, channel attention (SE),
-    dual pooling (avg+max), deeper FC head
-  - No sigmoid in decoder (moved to loss function for numerical stability)
+Architecture Overview:
+  - Encoder: Takes a cover image (3×H×W) and a binary message (L bits),
+    produces a stego image (3×H×W) with the message hidden inside.
+  - Decoder: Takes a (possibly distorted) stego image and extracts
+    the hidden binary message.
+
+Both networks use convolutional architectures with batch normalization
+and ReLU activations. The encoder uses residual learning (output = input + residual)
+to ensure minimal visible modification to the cover image.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.config import MESSAGE_LENGTH, IMAGE_CHANNELS
 
 
 class ConvBNReLU(nn.Module):
-    """Conv2D → BatchNorm → ReLU with optional stride for downsampling."""
+    """
+    A convenience building block: Conv2D → BatchNorm → ReLU.
 
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+    All convolutions use 3×3 kernels with padding=1 to maintain
+    spatial dimensions throughout the network.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3,
-                      padding=1, stride=stride, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
@@ -31,116 +38,79 @@ class ConvBNReLU(nn.Module):
         return self.block(x)
 
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation channel attention block."""
-
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(channels, max(channels // reduction, 8)),
-            nn.ReLU(inplace=True),
-            nn.Linear(max(channels // reduction, 8), channels),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, _, _ = x.shape
-        # Squeeze: global average pooling
-        y = F.adaptive_avg_pool2d(x, 1).view(b, c)
-        # Excitation: FC → sigmoid
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y
-
-
-class ResBlock(nn.Module):
-    """Residual block with two Conv-BN-ReLU layers and optional SE attention."""
-
-    def __init__(self, channels: int, use_se: bool = True):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.se = SEBlock(channels) if use_se else nn.Identity()
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = self.se(out)
-        return self.relu(out + residual)
-
-
 class Encoder(nn.Module):
     """
-    Improved Steganographic Encoder.
+    Steganographic Encoder Network.
 
-    Key improvements:
-      1. Message pre-processing MLP for richer bit representations
-      2. Deeper post-fusion with residual blocks
-      3. Smooth residual scaling (tanh * scale_factor) instead of raw clamp
+    Takes a cover image and a binary message, and produces a stego image
+    that visually resembles the cover but contains the hidden message.
+
+    Architecture:
+        1. Initial feature extraction from the cover image (3 Conv-BN-ReLU blocks).
+        2. Message expansion: the 1D message vector is spatially replicated to
+           match the image dimensions and concatenated with the feature maps.
+        3. Post-fusion processing (2 Conv-BN-ReLU blocks + 1 Conv2D output layer).
+        4. Residual addition: stego_image = cover_image + encoder_residual.
+
+    Args:
+        message_length (int): Length of the binary message in bits.
+        hidden_channels (int): Number of feature channels in hidden layers.
     """
 
     def __init__(self, message_length: int = MESSAGE_LENGTH, hidden_channels: int = 128):
         super().__init__()
         self.message_length = message_length
 
-        # Message pre-processing: transform bits into richer representations
-        self.message_mlp = nn.Sequential(
-            nn.Linear(message_length, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.ReLU(inplace=True),
-        )
-
         # Stage 1: Extract features from the cover image
         self.image_pre = nn.Sequential(
             ConvBNReLU(IMAGE_CHANNELS, hidden_channels),
             ConvBNReLU(hidden_channels, hidden_channels),
-            ResBlock(hidden_channels, use_se=True),
+            ConvBNReLU(hidden_channels, hidden_channels),
         )
 
-        # Stage 2: Process fused image features + processed message
-        # Input channels = hidden_channels (image) + hidden_channels (message)
+        # Stage 2: Process fused image features + message
+        # Input channels = hidden_channels + message_length (after concatenation)
         self.image_post = nn.Sequential(
-            ConvBNReLU(hidden_channels * 2, hidden_channels),
-            ResBlock(hidden_channels, use_se=True),
-            ResBlock(hidden_channels, use_se=True),
+            ConvBNReLU(hidden_channels + message_length, hidden_channels),
+            ConvBNReLU(hidden_channels, hidden_channels),
         )
 
-        # Stage 3: Generate 3-channel residual with tanh for bounded output
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(hidden_channels, IMAGE_CHANNELS, kernel_size=1),
-            nn.Tanh(),
-        )
-
-        # Learnable residual scaling factor (starts small)
-        self.scale = nn.Parameter(torch.tensor(0.1))
+        # Stage 3: Final convolution to produce 3-channel residual
+        self.final_conv = nn.Conv2d(hidden_channels, IMAGE_CHANNELS, kernel_size=1)
 
     def forward(self, cover_image: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the encoder.
+
+        Args:
+            cover_image (Tensor): Cover image, shape (B, 3, H, W), values in [0, 1].
+            message (Tensor): Binary message, shape (B, L), values in {0, 1}.
+
+        Returns:
+            stego_image (Tensor): Stego image with hidden message, shape (B, 3, H, W).
+        """
         batch_size = cover_image.shape[0]
         height, width = cover_image.shape[2], cover_image.shape[3]
 
         # Extract image features
-        image_features = self.image_pre(cover_image)  # (B, C, H, W)
+        image_features = self.image_pre(cover_image)  # (B, 64, H, W)
 
-        # Pre-process message through MLP, then expand spatially
-        message_processed = self.message_mlp(message)  # (B, C)
-        message_expanded = message_processed.unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1)
-        message_expanded = message_expanded.expand(-1, -1, height, width)  # (B, C, H, W)
+        # Expand message to spatial dimensions: (B, L) → (B, L, H, W)
+        # Each bit is replicated across the entire spatial grid
+        message_expanded = message.unsqueeze(-1).unsqueeze(-1)  # (B, L, 1, 1)
+        message_expanded = message_expanded.expand(-1, -1, height, width)  # (B, L, H, W)
 
-        # Concatenate image features and processed message
-        fused = torch.cat([image_features, message_expanded], dim=1)  # (B, 2C, H, W)
+        # Concatenate image features and expanded message along channel dim
+        fused = torch.cat([image_features, message_expanded], dim=1)  # (B, 64+L, H, W)
 
         # Process fused features
-        post_features = self.image_post(fused)  # (B, C, H, W)
+        post_features = self.image_post(fused)  # (B, 64, H, W)
 
-        # Generate bounded residual and add to cover image
-        residual = self.final_conv(post_features)  # (B, 3, H, W), range [-1, 1]
-        stego_image = cover_image + self.scale * residual
+        # Generate residual and add to cover image
+        residual = self.final_conv(post_features)  # (B, 3, H, W)
+        stego_image = cover_image + residual
 
-        # Clamp to valid range (soft via tanh scaling, so rarely triggered)
+        # Clamp to valid image range [0, 1]
         stego_image = torch.clamp(stego_image, 0.0, 1.0)
 
         return stego_image
@@ -148,90 +118,102 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Improved Steganographic Decoder.
+    Steganographic Decoder Network (Improved Architecture).
 
-    Key improvements:
-      1. Multi-scale feature extraction with downsampling
-      2. SE channel attention at each scale
-      3. Dual pooling (average + max) for richer feature vectors
-      4. Deeper FC head with dropout
-      5. No sigmoid — outputs raw logits (sigmoid applied in loss)
+    Takes a (possibly distorted) stego image and extracts the hidden binary message.
+    
+    This improved decoder uses:
+      1. Higher capacity (128 hidden channels instead of 64)
+      2. Multi-scale feature aggregation with skip connections
+      3. Spatial attention to focus on message-bearing regions
+      4. Better feature representation before message prediction
+
+    Args:
+        message_length (int): Length of the binary message in bits.
+        hidden_channels (int): Number of feature channels in hidden layers.
     """
 
     def __init__(self, message_length: int = MESSAGE_LENGTH, hidden_channels: int = 128):
         super().__init__()
         self.message_length = message_length
 
-        # Scale 1: Full resolution feature extraction
-        self.scale1 = nn.Sequential(
-            ConvBNReLU(IMAGE_CHANNELS, hidden_channels),
-            ResBlock(hidden_channels, use_se=True),
-        )
-
-        # Scale 2: Downsample by 2x
-        self.scale2 = nn.Sequential(
-            ConvBNReLU(hidden_channels, hidden_channels * 2, stride=2),
-            ResBlock(hidden_channels * 2, use_se=True),
-        )
-
-        # Scale 3: Downsample by another 2x
-        self.scale3 = nn.Sequential(
-            ConvBNReLU(hidden_channels * 2, hidden_channels * 2, stride=2),
-            ResBlock(hidden_channels * 2, use_se=True),
-        )
-
-        # Feature dimensions after dual pooling at each scale:
-        # Scale1: hidden_channels * 2 (avg + max pooling)
-        # Scale2: hidden_channels * 2 * 2
-        # Scale3: hidden_channels * 2 * 2
-        fc_input_size = hidden_channels * 2 + hidden_channels * 2 * 2 + hidden_channels * 2 * 2
-        # = hidden_channels * 10
-
-        # FC head for message prediction (outputs logits, no sigmoid)
-        self.fc_head = nn.Sequential(
-            nn.Linear(fc_input_size, hidden_channels * 4),
+        # Stage 1: Initial feature extraction
+        self.conv1 = ConvBNReLU(IMAGE_CHANNELS, hidden_channels)
+        
+        # Stage 2: Deeper feature extraction
+        self.conv2 = ConvBNReLU(hidden_channels, hidden_channels)
+        self.conv3 = ConvBNReLU(hidden_channels, hidden_channels)
+        
+        # Stage 3: Very deep feature extraction
+        self.conv4 = ConvBNReLU(hidden_channels, hidden_channels * 2)
+        self.conv5 = ConvBNReLU(hidden_channels * 2, hidden_channels * 2)
+        
+        # Spatial attention: learns which regions are important
+        self.attention = nn.Sequential(
+            nn.Conv2d(hidden_channels * 2, hidden_channels, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_channels * 4, hidden_channels * 2),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # Global pooling + FC layers for message prediction
+        # Input features: attention-weighted high features (hidden_channels*2) + skip features (hidden_channels)
+        fc_input_size = hidden_channels * 3
+        
+        self.fc_layers = nn.Sequential(
+            nn.Linear(fc_input_size, hidden_channels * 2),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
-            nn.Linear(hidden_channels * 2, message_length),
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_channels, message_length)
         )
-
-    def _dual_pool(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply both average and max global pooling, concatenate results."""
-        avg = F.adaptive_avg_pool2d(x, 1).flatten(1)
-        mx = F.adaptive_max_pool2d(x, 1).flatten(1)
-        return torch.cat([avg, mx], dim=1)
 
     def forward(self, stego_image: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass. Returns raw logits (NOT probabilities).
-        Apply sigmoid externally for inference, or use BCEWithLogitsLoss for training.
+        Forward pass with improved feature extraction and spatial awareness.
+
+        Args:
+            stego_image (Tensor): Stego image, shape (B, 3, H, W), values in [0, 1].
+
+        Returns:
+            decoded_message (Tensor): Per-bit probabilities, shape (B, L).
         """
-        # Multi-scale feature extraction
-        f1 = self.scale1(stego_image)   # (B, C, H, W)
-        f2 = self.scale2(f1)            # (B, 2C, H/2, W/2)
-        f3 = self.scale3(f2)            # (B, 2C, H/4, W/4)
-
-        # Dual pooling at each scale
-        p1 = self._dual_pool(f1)  # (B, 2C)
-        p2 = self._dual_pool(f2)  # (B, 4C)
-        p3 = self._dual_pool(f3)  # (B, 4C)
-
+        batch_size = stego_image.shape[0]
+        
+        # Extract multi-level features
+        f1 = self.conv1(stego_image)  # (B, hidden_channels, H, W)
+        f2 = self.conv2(f1)            # (B, hidden_channels, H, W)
+        f3 = self.conv3(f2)            # (B, hidden_channels, H, W)
+        f4 = self.conv4(f3)            # (B, hidden_channels*2, H, W)
+        f5 = self.conv5(f4)            # (B, hidden_channels*2, H, W)
+        
+        # Compute spatial attention weights
+        attention_weights = self.attention(f5)  # (B, 1, H, W)
+        
+        # Apply attention to features and pool
+        f5_attention = f5 * attention_weights  # Spatial weighting
+        f5_pooled = nn.functional.adaptive_avg_pool2d(f5_attention, (1, 1))  # (B, hidden_channels*2, 1, 1)
+        f5_pooled = f5_pooled.squeeze(3).squeeze(2)  # (B, hidden_channels*2)
+        
+        # Pool skip-connection features
+        f3_pooled = nn.functional.adaptive_avg_pool2d(f3, (1, 1))  # (B, hidden_channels, 1, 1)
+        f3_pooled = f3_pooled.squeeze(3).squeeze(2)  # (B, hidden_channels)
+        
         # Concatenate multi-scale features
-        combined = torch.cat([p1, p2, p3], dim=1)  # (B, 10C)
-
-        # Predict message bits (logits)
-        logits = self.fc_head(combined)  # (B, message_length)
-
-        return logits
+        combined_features = torch.cat([f5_pooled, f3_pooled], dim=1)  # (B, hidden_channels*3)
+        
+        # Predict message bits
+        decoded_message = torch.sigmoid(self.fc_layers(combined_features))  # (B, message_length)
+        
+        return decoded_message
 
 
 # ============================================================================
 # Utility: Create encoder-decoder pair
 # ============================================================================
-def create_model(message_length: int = MESSAGE_LENGTH, hidden_channels: int = 128):
+def create_model(message_length: int = MESSAGE_LENGTH, hidden_channels: int = 64):
     """
     Factory function to create an encoder-decoder pair.
 
